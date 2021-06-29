@@ -1,11 +1,43 @@
 # HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis
 
-# 想定
-    - input_path
-        - wavs: ここにwavをためる
-        - mels: 対応するmelを入れる.
-        - train.txt
-        - val.txt
+## 想定
+- input_path
+    - wavs: ここにwavをためる
+    - mels: 対応するmelを入れる.
+    - train.txt
+    - val.txt
+    - config.json
+
+- output_path
+    - (finetuningに用いる最初の重みを投入する)
+
+## 使い方
+### train(fine tuning)
+- trainするときはさすがにcwdはhifi-ganにしようね.
+
+- 基本, finetuningで. universalが良さそうなので, [こちら](https://drive.google.com/drive/folders/1YuOoV3lO2-Hhn1F2HJ2aQ4S0LC1JdKLd)を利用する.
+
+- 重みを保存するフォルダを作成し, その中に↑これを入れる.
+
+- また, input_pathも作り, 想定は上述.
+
+- そして, configもinput_path内にあると良さそう.
+
+- ここまで用意出来たら, 
+`python train.py --input_path $input_path --checkpoint_path $output_path --config $config_path --fine_tuning`
+これを実行.
+
+### inference
+- これはNARS2Sを通して利用する場合
+
+- hifi-gan直下に
+    - config.json: 以下の重みを訓練する際に利用したもの.
+    - 重みファイル
+    - この2つを配置する.
+
+- その後, 
+    - get_vocoderの`ckpt = torch.load("hifigan/generator_universal.pth.tar", map_location=device)`
+    - この行を, 自分で用意した重みのpathに変える.
 
 ### Jungil Kong, Jaehyeon Kim, Jaekyoung Bae
 
