@@ -1,5 +1,12 @@
 # HiFi-GAN: Generative Adversarial Networks for Efficient and High Fidelity Speech Synthesis
 
+# 想定
+    - input_path
+        - wavs: ここにwavをためる
+        - mels: 対応するmelを入れる.
+        - train.txt
+        - val.txt
+
 ### Jungil Kong, Jaehyeon Kim, Jaekyoung Bae
 
 In our [paper](https://arxiv.org/abs/2010.05646), 

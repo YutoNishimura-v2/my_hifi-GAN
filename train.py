@@ -1,27 +1,53 @@
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+import argparse
 import itertools
+import json
 import os
 import time
-import argparse
-import json
+import warnings
+
 import torch
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DistributedSampler, DataLoader
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 from torch.distributed import init_process_group
 from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
+
 from env import AttrDict, build_env
-from meldataset import MelDataset, mel_spectrogram, get_dataset_filelist
-from models import Generator, MultiPeriodDiscriminator, MultiScaleDiscriminator, feature_loss, generator_loss,\
-    discriminator_loss
-from utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
+from meldataset import MelDataset, get_dataset_filelist, mel_spectrogram
+from models import (Generator, MultiPeriodDiscriminator,
+                    MultiScaleDiscriminator, discriminator_loss, feature_loss,
+                    generator_loss)
+from utils import (load_checkpoint, plot_spectrogram, save_checkpoint,
+                   scan_checkpoint)
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 torch.backends.cudnn.benchmark = True
 
 
 def train(rank, a, h):
+    """
+    Args:
+      a: args
+        parser.add_argument('--group_name', default=None)
+        parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
+        parser.add_argument('--input_mels_dir', default='ft_dataset')
+        parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
+        parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+        parser.add_argument('--checkpoint_path', default='cp_hifigan')
+        parser.add_argument('--config', default='')
+        parser.add_argument('--training_epochs', default=3100, type=int)
+        parser.add_argument('--stdout_interval', default=5, type=int)
+        parser.add_argument('--checkpoint_interval', default=5000, type=int)
+        parser.add_argument('--summary_interval', default=100, type=int)
+        parser.add_argument('--validation_interval', default=1000, type=int)
+        parser.add_argument('--fine_tuning', default=False, type=bool)
+      h: config
+
+    ここでは, input, outputとして, wavを使っているが, 出来ればNARS2Sで作ったmelでやりたいので,
+    melのinputのみを受け付ける形に変更する.
+    """
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
@@ -71,12 +97,13 @@ def train(rank, a, h):
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
+    # ここでtrainのwav_pathを読み込む.
     training_filelist, validation_filelist = get_dataset_filelist(a)
 
     trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir)
+                          fine_tuning=a.fine_tuning, base_mels_path=os.path.join(a.input_path, 'mels'))
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -86,11 +113,11 @@ def train(rank, a, h):
                               pin_memory=True,
                               drop_last=True)
 
-    if rank == 0:
+    if rank == 0:  # multi_gpuでないならrank == 0らしい.
         validset = MelDataset(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              base_mels_path=a.input_mels_dir)
+                              base_mels_path=os.path.join(a.input_path, 'mels'))
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
@@ -110,7 +137,7 @@ def train(rank, a, h):
         if h.num_gpus > 1:
             train_sampler.set_epoch(epoch)
 
-        for i, batch in enumerate(train_loader):
+        for _, batch in enumerate(train_loader):
             if rank == 0:
                 start_b = time.time()
             x, y, _, y_mel = batch
@@ -120,16 +147,16 @@ def train(rank, a, h):
             y = y.unsqueeze(1)
 
             y_g_hat = generator(x)
-            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
-                                          h.fmin, h.fmax_for_loss)
+            y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size,
+                                          h.win_size, h.fmin, h.fmax_for_loss)
 
             optim_d.zero_grad()
 
-            # MPD
+            # MPD: multi period descriminator
             y_df_hat_r, y_df_hat_g, _, _ = mpd(y, y_g_hat.detach())
             loss_disc_f, losses_disc_f_r, losses_disc_f_g = discriminator_loss(y_df_hat_r, y_df_hat_g)
 
-            # MSD
+            # MSD: multi scale descriminator
             y_ds_hat_r, y_ds_hat_g, _, _ = msd(y, y_g_hat.detach())
             loss_disc_s, losses_disc_s_r, losses_disc_s_g = discriminator_loss(y_ds_hat_r, y_ds_hat_g)
 
@@ -141,7 +168,7 @@ def train(rank, a, h):
             # Generator
             optim_g.zero_grad()
 
-            # L1 Mel-Spectrogram Loss
+            # L1 Mel-Spectrogram Loss  # melのlossもみるみたい.
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
@@ -170,11 +197,11 @@ def train(rank, a, h):
                     save_checkpoint(checkpoint_path,
                                     {'generator': (generator.module if h.num_gpus > 1 else generator).state_dict()})
                     checkpoint_path = "{}/do_{:08d}".format(a.checkpoint_path, steps)
-                    save_checkpoint(checkpoint_path, 
+                    save_checkpoint(checkpoint_path,
                                     {'mpd': (mpd.module if h.num_gpus > 1
-                                                         else mpd).state_dict(),
+                                             else mpd).state_dict(),
                                      'msd': (msd.module if h.num_gpus > 1
-                                                         else msd).state_dict(),
+                                             else msd).state_dict(),
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
 
@@ -219,7 +246,7 @@ def train(rank, a, h):
 
         scheduler_g.step()
         scheduler_d.step()
-        
+
         if rank == 0:
             print('Time taken for epoch {} is {} sec\n'.format(epoch + 1, int(time.time() - start)))
 
@@ -230,10 +257,7 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='LJSpeech-1.1/wavs')
-    parser.add_argument('--input_mels_dir', default='ft_dataset')
-    parser.add_argument('--input_training_file', default='LJSpeech-1.1/training.txt')
-    parser.add_argument('--input_validation_file', default='LJSpeech-1.1/validation.txt')
+    parser.add_argument('--input_path', default=None)
     parser.add_argument('--checkpoint_path', default='cp_hifigan')
     parser.add_argument('--config', default='')
     parser.add_argument('--training_epochs', default=3100, type=int)
